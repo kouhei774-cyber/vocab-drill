@@ -141,6 +141,9 @@
       const [eng,      setEng]     = useState('');
       const [jp,       setJp]      = useState('');
       const [addDone,  setAddDone] = useState(false);
+      const [bulkText, setBulkText]= useState('');
+      const [bulkMsg,  setBulkMsg] = useState(null);
+      const [candidates, setCandidates] = useState([]); // {english, japanese, checked, dup}
 
       const due      = buildQueue(words);
       const mastered = words.filter(w =>
@@ -193,6 +196,47 @@
 
       function del(id) { update(words.filter(w => w.id !== id)); }
 
+      function parseCandidates() {
+        const lines = bulkText.split('\n').map(l => l.trim()).filter(Boolean);
+        const existing = new Set(words.map(w => w.english.toLowerCase()));
+        const list = [];
+
+        lines.forEach(line => {
+          // 区切り文字: タブ、カンマ、または全角/半角コロンに対応
+          const parts = line.split(/\t|,|：|:/).map(s => s.trim()).filter(Boolean);
+          if (parts.length < 2) return;
+          const [e, ...rest] = parts;
+          const j = rest.join(' ').trim();
+          if (!e || !j) return;
+          const dup = existing.has(e.toLowerCase());
+          list.push({ english: e, japanese: j, checked: !dup, dup });
+        });
+
+        setCandidates(list);
+      }
+
+      function toggleCandidate(idx) {
+        setCandidates(cs => cs.map((c, i) => i === idx ? { ...c, checked: !c.checked } : c));
+      }
+
+      function confirmAddSelected() {
+        const selected = candidates.filter(c => c.checked);
+        if (!selected.length) return;
+        const nw = [
+          ...words,
+          ...selected.map((c, idx) => ({
+            id: `${Date.now()}-${idx}`,
+            english: c.english, japanese: c.japanese,
+            interval: 1, easeFactor: 2.5, repetitions: 0,
+            nextReview: 0, correctCount: 0, totalCount: 0,
+          })),
+        ];
+        update(nw);
+        setBulkMsg(`${selected.length}語を追加しました`);
+        setBulkText(''); setCandidates([]);
+        setTimeout(() => setBulkMsg(null), 3000);
+      }
+
       // ── HOME ──
       if (screen === 'home') return (
         <div style={S.app}>
@@ -224,6 +268,9 @@
               <button style={S.btnSub} onClick={() => setScreen('add')}>＋ 単語を追加</button>
               <button style={S.btnSub} onClick={() => setScreen('list')}>📋 単語一覧</button>
             </div>
+            <button style={{ ...S.btnSub, textAlign: 'center' }} onClick={() => setScreen('bulk')}>
+              📥 まとめて追加
+            </button>
             {words.length > 0 && due.length === 0 && (() => {
               const next = words
                 .filter(w => w.nextReview > Date.now())
@@ -382,129 +429,61 @@
         </div>
       );
 
-      // ── LIST ──
-      if (screen === 'list') {
-        const sorted = [...words].sort((a, b) => {
-          const accA = a.totalCount ? a.correctCount / a.totalCount : 0;
-          const accB = b.totalCount ? b.correctCount / b.totalCount : 0;
-          return accA - accB;
-        });
-        return (
-          <div style={S.app}>
-            <header style={S.header}>
-              <button style={S.backBtn} onClick={() => setScreen('home')}>← ホーム</button>
-              <span style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>
-                単語一覧 <span style={{ color: C.muted, fontWeight: 400 }}>({words.length})</span>
-              </span>
-              <div style={{ width: 60 }} />
-            </header>
-            <div style={{ ...S.content, gap: 8, overflowY: 'auto', paddingBottom: 32 }}>
-              {words.length === 0 && (
-                <div style={{ color: C.dim, textAlign: 'center', marginTop: 60 }}>
-                  単語がまだありません
-                </div>
-              )}
-              {sorted.map(w => {
-                const acc = w.totalCount ? Math.round(w.correctCount / w.totalCount * 100) : null;
-                const isDue = (w.nextReview || 0) <= Date.now();
-                return (
-                  <div key={w.id} style={S.wordRow}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                        <span style={{ fontWeight: 600, color: C.text, fontSize: 15 }}>{w.english}</span>
-                        {isDue && (
-                          <span style={{
-                            background: C.amber, color: '#07090F',
-                            fontSize: 9, fontWeight: 700, borderRadius: 4, padding: '2px 5px',
-                          }}>復習</span>
-                        )}
-                      </div>
-                      <div style={{ color: C.muted, fontSize: 13, marginTop: 2 }}>{w.japanese}</div>
-                      <div style={{ color: C.dim, fontSize: 11, marginTop: 4 }}>
-                        {acc !== null
-                          ? <span style={{ color: acc >= 80 ? C.green : acc >= 50 ? C.amber : C.red }}>
-                              正答率 {acc}%
-                            </span>
-                          : <span>未学習</span>}
-                        {' · '}次回: {nextStr(w.nextReview)}
-                      </div>
-                    </div>
-                    <button style={S.delBtn} onClick={() => del(w.id)}>✕</button>
-                  </div>
-                );
-              })}
+      // ── BULK ADD ──
+      if (screen === 'bulk') return (
+        <div style={S.app}>
+          <header style={S.header}>
+            <button
+              style={S.backBtn}
+              onClick={() => {
+                if (candidates.length) { setCandidates([]); setBulkText(''); }
+                else setScreen('home');
+              }}
+            >
+              ← {candidates.length ? 'やり直す' : 'ホーム'}
+            </button>
+            <span style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>まとめて追加</span>
+            <div style={{ width: 60 }} />
+          </header>
+
+          {candidates.length === 0 ? (
+            <div style={{ ...S.content, gap: 12 }}>
+              <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.7 }}>
+                1行に「英語　日本語」を1組ずつ貼り付けて、次の画面で登録したい単語だけ選べます。<br/>
+                区切りはカンマ・コロン・タブいずれでもOK。
+              </div>
+              <textarea
+                style={S.textarea}
+                placeholder={'例:\nmention, 言及する\ncourageous, 勇気のある\nadjust, 慣れる、順応する'}
+                value={bulkText}
+                onChange={e => setBulkText(e.target.value)}
+                rows={10}
+              />
+              <button
+                style={{ ...S.btnPrimary, opacity: bulkText.trim() ? 1 : 0.35 }}
+                onClick={parseCandidates}
+                disabled={!bulkText.trim()}
+              >
+                候補を表示する
+              </button>
             </div>
-          </div>
-        );
-      }
-
-      return null;
-    }
-
-    // ── Styles ───────────────────────────────────────────────
-    const S = {
-      app: {
-        fontFamily: "'Inter', 'Noto Sans JP', sans-serif",
-        background: C.bg, minHeight: '100vh', minHeight: '100dvh',
-        color: C.text, display: 'flex', flexDirection: 'column',
-      },
-      header: {
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '14px 20px', borderBottom: `1px solid ${C.border}`,
-      },
-      logo:     { fontSize: 22 },
-      logoText: { fontSize: 14, fontWeight: 700, letterSpacing: 3, color: C.amber, flex: 1, marginLeft: 10 },
-      backBtn:  { background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 13, padding: 0, width: 60, textAlign: 'left' },
-      content:  { flex: 1, display: 'flex', flexDirection: 'column', padding: '20px 20px', gap: 14 },
-      statsRow: { display: 'flex', gap: 10 },
-      emptyBox: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 16, padding: '32px 20px', textAlign: 'center' },
-      btnPrimary: {
-        background: C.amber, border: 'none', borderRadius: 14,
-        padding: '16px', fontSize: 16, fontWeight: 700,
-        color: '#07090F', cursor: 'pointer', width: '100%',
-      },
-      btnSub: {
-        background: C.surface, border: `1px solid ${C.border}`,
-        borderRadius: 12, padding: '13px', fontSize: 14,
-        color: C.text, cursor: 'pointer', flex: 1, width: '100%',
-      },
-      row:       { display: 'flex', gap: 10, width: '100%' },
-      btnOk: {
-        flex: 1, background: 'rgba(34,197,94,0.12)', border: `1px solid ${C.green}`,
-        borderRadius: 12, padding: '15px', color: C.green, fontSize: 15, fontWeight: 700, cursor: 'pointer',
-      },
-      btnNg: {
-        flex: 1, background: 'rgba(239,68,68,0.08)', border: `1px solid ${C.red}`,
-        borderRadius: 12, padding: '15px', color: C.red, fontSize: 15, fontWeight: 700, cursor: 'pointer',
-      },
-      input: {
-        background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12,
-        padding: '14px 16px', color: C.text, fontSize: 15, outline: 'none',
-        width: '100%',
-      },
-      label:     { color: C.muted, fontSize: 12, fontWeight: 500, letterSpacing: 1 },
-      resultBox: {
-        background: C.surface, border: `1px solid ${C.border}`,
-        borderRadius: 16, display: 'flex', width: '100%', maxWidth: 340,
-      },
-      wordRow: {
-        background: C.surface, border: `1px solid ${C.border}`,
-        borderRadius: 12, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10,
-      },
-      delBtn: { background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: 14, padding: '4px 8px', flexShrink: 0 },
-    };
-
-    // ── Mount ────────────────────────────────────────────────
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
-  </script>
-
-  <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('./sw.js')
-          .catch(e => console.log('SW registration failed:', e));
-      });
-    }
-  </script>
-</body>
-</html>
+          ) : (
+            <div style={{ ...S.content, gap: 0 }}>
+              <div style={{ color: C.muted, fontSize: 12, marginBottom: 10 }}>
+                間違えやすい単語だけチェックを入れてください（{candidates.filter(c => c.checked).length}/{candidates.length}件選択中）
+              </div>
+              <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6, paddingBottom: 12 }}>
+                {candidates.map((c, idx) => (
+                  <label
+                    key={idx}
+                    style={{
+                      ...S.wordRow,
+                      cursor: 'pointer',
+                      opacity: c.dup && !c.checked ? 0.5 : 1,
+                      borderColor: c.checked ? C.amber : C.border,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={c.checked}
+                      onChange=
