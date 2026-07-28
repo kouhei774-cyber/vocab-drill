@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>VOCAB DRILL</title>
+  <link rel="manifest" href="./manifest.json">
+  <meta name="theme-color" content="#F5A623">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="単語帳">
+  <link rel="apple-touch-icon" href="./icon.svg">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; background: #07090F; }
+    body { overscroll-behavior: none; }
+    #root { min-height: 100vh; min-height: 100dvh; }
+    input, button { font-family: inherit; }
+    input { -webkit-appearance: none; border-radius: 0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    // ── Design Tokens ────────────────────────────────────────
+    const C = {
+      bg:      '#07090F',
+      surface: '#0E1525',
+      card:    '#111C30',
+      border:  '#1A2840',
+      amber:   '#F5A623',
+      indigo:  '#6366F1',
+      green:   '#22C55E',
+      red:     '#EF4444',
+      text:    '#E2E8F5',
+      muted:   '#6B7FA8',
+      dim:     '#3A4A66',
+    };
+
+    // ── SM-2 Algorithm ───────────────────────────────────────
+    function sm2(word, correct) {
+      let { interval = 1, easeFactor = 2.5, repetitions = 0 } = word;
+      const q = correct ? 5 : 1;
+      if (q >= 3) {
+        if (repetitions === 0)      interval = 1;
+        else if (repetitions === 1) interval = 6;
+        else                        interval = Math.round(interval * easeFactor);
+        easeFactor = Math.max(1.3, easeFactor + 0.1 - (5-q)*(0.08+(5-q)*0.02));
+        repetitions++;
+      } else {
+        repetitions = 0; interval = 1;
+        easeFactor = Math.max(1.3, easeFactor - 0.2);
+      }
+      return {
+        ...word, interval, easeFactor, repetitions,
+        nextReview:   Date.now() + interval * 86400000,
+        correctCount: (word.correctCount || 0) + (correct ? 1 : 0),
+        totalCount:   (word.totalCount   || 0) + 1,
+      };
+    }
+
+    function buildQueue(words) {
+      const now = Date.now();
+      return words
+        .filter(w => (w.nextReview || 0) <= now)
+        .sort((a, b) => {
+          const accA = a.totalCount ? a.correctCount / a.totalCount : 0;
+          const accB = b.totalCount ? b.correctCount / b.totalCount : 0;
+          if (Math.abs(accA - accB) > 0.15) return accA - accB;
+          return (a.nextReview || 0) - (b.nextReview || 0);
+        });
+    }
+
+    function nextStr(ts) {
+      if (!ts || ts <= Date.now()) return '今すぐ';
+      const d = ts - Date.now();
+      if (d < 3600000)  return `${Math.floor(d / 60000)}分後`;
+      if (d < 86400000) return `${Math.floor(d / 3600000)}時間後`;
+      return `${Math.floor(d / 86400000)}日後`;
+    }
+
+    // ── Storage ──────────────────────────────────────────────
+    const KEY = 'vocab-fc-v1';
+    const BKEY = 'vocab-fc-lastbackup';
+
+    function loadWords() {
+      try {
+        const s = localStorage.getItem(KEY);
+        return s ? JSON.parse(s) : [];
+      } catch { return []; }
+    }
+
+    function saveWords(w) {
+      try { localStorage.setItem(KEY, JSON.stringify(w)); } catch {}
+    }
+
+    // ── Sub-components ───────────────────────────────────────
+    function StatCard({ label, value, highlight, green }) {
+      return (
+        <div style={{
+          background: C.surface, border: `1px solid ${C.border}`,
+          borderRadius: 14, padding: '18px 10px', textAlign: 'center', flex: 1,
+        }}>
+          <div style={{ fontSize: 26, fontWeight: 700,
+            color: highlight ? C.amber : green ? C.green : C.text }}>
+            {value}
+          </div>
+          <div style={{ fontSize: 10, color: C.muted, marginTop: 4, lineHeight: 1.4 }}>{label}</div>
+        </div>
+      );
+    }
+
+    function ResultRow({ label, value, color }) {
+      return (
+        <div style={{ flex: 1, textAlign: 'center', padding: '14px 0' }}>
+          <div style={{ fontSize: 24, fontWeight: 700, color }}>{value}</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{label}</div>
+        </div>
+      );
+    }
+
+    // ── App ──────────────────────────────────────────────────
+    function App() {
+      const [words,    setWords]   = useState(() => loadWords());
+      const [screen,   setScreen]  = useState('home');
+      const [queue,    setQueue]   = useState([]);
+      const [qi,       setQi]      = useState(0);
+      const [flipped,  setFlipped] = useState(false);
+      const [animating,setAnim]    = useState(false);
+      const [feedback, setFb]      = useState(null);
+      const [sess,     setSess]    = useState({ ok: 0, ng: 0 });
+      const [done,     setDone]    = useState(false);
+      const [eng,      setEng]     = useState('');
+      const [jp,       setJp]      = useState('');
+      const [addDone,  setAddDone] = useState(false);
+      const [bulkText, setBulkText]= useState('');
+      const [bulkMsg,  setBulkMsg] = useState(null);
+      const [candidates, setCandidates] = useState([]); // {english, japanese, checked, dup}
+      const [lastBackup, setLastBackup] = useState(() => {
+        try { return Number(localStorage.getItem(BKEY)) || null; } catch { return null; }
+      });
+      const [exportText, setExportText] = useState('');
+      const [importText, setImportText] = useState('');
+      const [backupMsg, setBackupMsg]   = useState(null);
+      const [copied,    setCopied]      = useState(false);
+
+      const due      = buildQueue(words);
+      const mastered = words.filter(w =>
+        w.repetitions >= 3 && w.totalCount > 0 && w.correctCount / w.totalCount >= 0.8
+      ).length;
+
+      const backupAgo   = lastBackup ? nextStr(2 * Date.now() - lastBackup).replace('後', '前') : null;
+      const backupStale = lastBackup ? (Date.now() - lastBackup) > 7 * 86400000 : false;
+
+      function update(nw) { setWords(nw); saveWords(nw); }
+
+      function startStudy() {
+        const q = buildQueue(words);
+        if (!q.length) return;
+        setQueue(q); setQi(0); setFlipped(false);
+        setSess({ ok: 0, ng: 0 }); setDone(false); setFb(null);
+        setScreen('study');
+      }
+
+      function doFlip() {
+        if (flipped || animating) return;
+        setAnim(true);
+        setTimeout(() => { setFlipped(true); setAnim(false); }, 180);
+      }
+
+      function answer(ok) {
+        if (feedback || !flipped) return;
+        setFb(ok ? 'ok' : 'ng');
+        const updated = sm2(queue[qi], ok);
+        const nw = words.map(w => w.id === updated.id ? updated : w);
+        update(nw);
+        setSess(s => ({ ok: s.ok + (ok ? 1 : 0), ng: s.ng + (ok ? 0 : 1) }));
+        setTimeout(() => {
+          setFb(null);
+          if (qi + 1 >= queue.length) { setDone(true); }
+          else { setQi(i => i + 1); setFlipped(false); }
+        }, 700);
+      }
+
+      function addWord() {
+        if (!eng.trim() || !jp.trim()) return;
+        const w = {
+          id: Date.now().toString(),
+          english: eng.trim(), japanese: jp.trim(),
+          interval: 1, easeFactor: 2.5, repetitions: 0,
+          nextReview: 0, correctCount: 0, totalCount: 0,
+        };
+        update([...words, w]);
+        setEng(''); setJp('');
+        setAddDone(true);
+        setTimeout(() => setAddDone(false), 1500);
+      }
+
+      function del(id) { update(words.filter(w => w.id !== id)); }
+
+      function parseCandidates() {
+        const lines = bulkText.split('\n').map(l => l.trim()).filter(Boolean);
+        const existing = new Set(words.map(w => w.english.toLowerCase()));
+        const list = [];
+
+        lines.forEach(line => {
+          // 区切り文字: タブ、カンマ、または全角/半角コロンに対応
+          const parts = line.split(/\t|,|：|:/).map(s => s.trim()).filter(Boolean);
+          if (parts.length < 2) return;
+          const [e, ...rest] = parts;
+          const j = rest.join(' ').trim();
+          if (!e || !j) return;
+          const dup = existing.has(e.toLowerCase());
+          list.push({ english: e, japanese: j, checked: !dup, dup });
+        });
+
+        setCandidates(list);
+      }
+
+      function toggleCandidate(idx) {
+        setCandidates(cs => cs.map((c, i) => i === idx ? { ...c, checked: !c.checked } : c));
+      }
+
+      function confirmAddSelected() {
+        const selected = candidates.filter(c => c.checked);
+        if (!selected.length) return;
+        const nw = [
+          ...words,
+          ...selected.map((c, idx) => ({
+            id: `${Date.now()}-${idx}`,
+            english: c.english, japanese: c.japanese,
+            interval: 1, easeFactor: 2.5, repetitions: 0,
+            nextReview: 0, correctCount: 0, totalCount: 0,
+          })),
+        ];
+        update(nw);
+        setBulkMsg(`${selected.length}語を追加しました`);
+        setBulkText(''); setCandidates([]);
+        setTimeout(() => setBulkMsg(null), 3000);
+      }
+
+      // ── バックアップ / 復元 ──
+      function makeExport() {
+        const json = JSON.stringify({ v: 1, exportedAt: Date.now(), words }, null, 0);
+        setExportText(json);
+        return json;
+      }
+
+      async function copyBackup() {
+        const json = exportText || makeExport();
+        try {
+          await navigator.clipboard.writeText(json);
+          markBackedUp();
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2500);
+        } catch {
+          setBackupMsg('コピーできませんでした。下のテキストを長押しして手動でコピーしてください');
+          setTimeout(() => setBackupMsg(null), 4000);
+        }
+      }
+
+      function downloadBackup() {
+        const json = exportText || makeExport();
+        try {
+          const blob = new Blob([json], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          const d = new Date();
+          const stamp = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+          a.href = url; a.download = `vocab-drill-backup-${stamp}.json`;
+          document.body.appendChild(a); a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          markBackedUp();
+          setBackupMsg('ファイルを保存しました');
+          setTimeout(() => setBackupMsg(null), 3000);
+        } catch {
+          setBackupMsg('保存できませんでした。コピー機能を使ってください');
+          setTimeout(() => setBackupMsg(null), 4000);
+        }
+      }
+
+      function markBackedUp() {
+        const now = Date.now();
+        try { localStorage.setItem(BKEY, String(now)); } catch {}
+        setLastBackup(now);
+      }
+
+      function restoreBackup(mode) {
+        const raw = importText.trim();
+        if (!raw) return;
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch {
+          setBackupMsg('データを読み取れませんでした。バックアップ全文が貼られているか確認してください');
+          setTimeout(() => setBackupMsg(null), 4000);
+          return;
+        }
+        const incoming = Array.isArray(parsed) ? parsed : parsed.words;
+        if (!Array.isArray(incoming) || !incoming.length) {
+          setBackupMsg('単語データが見つかりませんでした');
+          setTimeout(() => setBackupMsg(null), 4000);
+          return;
+        }
+        const clean = incoming
+          .filter(w => w && w.english && w.japanese)
+          .map((w, i) => ({
+            id: w.id || `r${Date.now()}-${i}`,
+            english: String(w.english), japanese: String(w.japanese),
+            interval: w.interval ?? 1, easeFactor: w.easeFactor ?? 2.5,
+            repetitions: w.repetitions ?? 0, nextReview: w.nextReview ?? 0,
+            correctCount: w.correctCount ?? 0, totalCount: w.totalCount ?? 0,
+          }));
+
+        let nw;
+        if (mode === 'replace') {
+          nw = clean;
+        } else {
+          const have = new Set(words.map(w => w.english.toLowerCase()));
+          nw = [...words, ...clean.filter(w => !have.has(w.english.toLowerCase()))];
+        }
+        update(nw);
+        setImportText('');
+        setBackupMsg(mode === 'replace'
+          ? `${clean.length}語で置き換えました`
+          : `${nw.length - words.length}語を追加しました（重複は除外）`);
+        setTimeout(() => setBackupMsg(null), 4000);
+      }
+
+      // ── HOME ──
+      if (screen === 'home') return (
+        <div style={S.app}>
+          <header style={S.header}>
+            <span style={S.logo}>📖</span>
+            <span style={S.logoText}>VOCAB DRILL</span>
+          </header>
+          <div style={S.content}>
+            <div style={S.statsRow}>
+              <StatCard label="総単語"   value={words.length} />
+              <StatCard label="本日の復習" value={due.length} highlight={due.length > 0} />
+              <StatCard label="習得済み"  value={mastered} green />
+            </div>
+            {due.length > 0 ? (
+              <button style={S.btnPrimary} onClick={startStudy}>
+                学習を始める <span style={{ opacity: 0.65, fontWeight: 500 }}>({due.length}語)</span>
+              </button>
+            ) : (
+              <div style={S.emptyBox}>
+                <div style={{ fontSize: 36, marginBottom: 8 }}>
+                  {words.length === 0 ? '📚' : '🎉'}
+                </div>
+                <div style={{ color: C.muted, fontSize: 14 }}>
+                  {words.length === 0 ? '単語を追加して学習を始めよう' : '本日の復習はすべて完了！'}
+                </div>
+              </div>
+            )}
+            <div style={S.row}>
+              <button style={S.btnSub} onClick={() => setScreen('add')}>＋ 単語を追加</button>
+              <button style={S.btnSub} onClick={() => setScreen('list')}>📋 単語一覧</button>
+            </div>
+            <button style={{ ...S.btnSub, textAlign: 'center' }} onClick={() => setScreen('bulk')}>
+              📥 まとめて追加
+            </button>
+            <button style={{ ...S.btnSub, textAlign: 'center' }} onClick={() => setScreen('backup')}>
+              💾 バックアップ / 復元
+            </button>
+            {words.length > 0 && lastBackup && (
+              <div style={{ textAlign: 'center', fontSize: 11, color: backupStale ? C.red : C.dim }}>
+                {backupStale ? '⚠️ ' : ''}最終バックアップ: {backupAgo}
+              </div>
+            )}
+            {words.length > 0 && !lastBackup && (
+              <div style={{ textAlign: 'center', fontSize: 11, color: C.red }}>
+                ⚠️ まだバックアップを取っていません
+              </div>
+            )}
+            {words.length > 0 && due.length === 0 && (() => {
+              const next = words
+                .filter(w => w.nextReview > Date.now())
+                .sort((a, b) => a.nextReview - b.nextReview)[0];
+              return next
+                ? <div style={{ textAlign:'center', color: C.dim, fontSize: 12, marginTop: 4 }}>
+                    次の復習: {nextStr(next.nextReview)}
+                  </div>
+                : null;
+            })()}
+          </div>
+        </div>
+      );
+
+      // ── STUDY ──
+      if (screen === 'study') {
+        if (done) {
+          const total = sess.ok + sess.ng;
+          const pct   = total ? Math.round(sess.ok / total * 100) : 0;
+          return (
+            <div style={S.app}>
+              <header style={S.header}>
+                <button style={S.backBtn} onClick={() => setScreen('home')}>← ホーム</button>
+              </header>
+              <div style={{ ...S.content, alignItems: 'center', justifyContent: 'center', gap: 20 }}>
+                <div style={{ fontSize: 56 }}>{pct >= 80 ? '🏆' : pct >= 50 ? '✨' : '💪'}</div>
+                <div style={{ fontSize: 22, fontWeight: 700 }}>セッション完了</div>
+                <div style={S.resultBox}>
+                  <ResultRow label="正解"   value={sess.ok}   color={C.green} />
+                  <div style={{ width: 1, background: C.border }} />
+                  <ResultRow label="不正解"  value={sess.ng}   color={C.red} />
+                  <div style={{ width: 1, background: C.border }} />
+                  <ResultRow label="正答率"  value={`${pct}%`} color={C.amber} />
+                </div>
+                <button style={S.btnPrimary} onClick={() => setScreen('home')}>ホームへ戻る</button>
+              </div>
+            </div>
+          );
+        }
+
+        const card    = queue[qi];
+        const progress= (qi / queue.length) * 100;
+        const acc     = card.totalCount ? Math.round(card.correctCount / card.totalCount * 100) : null;
+        const cardBg  = feedback === 'ok' ? 'rgba(34,197,94,0.06)' : feedback === 'ng' ? 'rgba(239,68,68,0.06)' : C.card;
+        const cardBdr = feedback === 'ok' ? C.green : feedback === 'ng' ? C.red : C.border;
+
+        return (
+          <div style={S.app}>
+            <header style={S.header}>
+              <button style={S.backBtn} onClick={() => setScreen('home')}>← ホーム</button>
+              <span style={{ color: C.muted, fontSize: 13 }}>{qi + 1} / {queue.length}</span>
+            </header>
+            <div style={{ height: 2, background: C.border }}>
+              <div style={{ height: '100%', width: `${progress}%`, background: C.indigo, transition: 'width 0.4s ease' }} />
+            </div>
+            <div style={{ ...S.content, alignItems: 'center', justifyContent: 'center', gap: 28 }}>
+              <div
+                style={{
+                  background: cardBg, border: `2px solid ${cardBdr}`,
+                  borderRadius: 24, padding: '44px 32px',
+                  width: '100%', maxWidth: 380, minHeight: 240,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  cursor: flipped ? 'default' : 'pointer',
+                  transform: animating ? 'rotateY(90deg) scale(0.97)' : 'rotateY(0) scale(1)',
+                  transition: 'transform 0.18s ease, border-color 0.3s, background 0.3s',
+                  boxShadow: '0 8px 48px rgba(0,0,0,0.5)',
+                }}
+                onClick={doFlip}
+              >
+                {!flipped ? (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ color: C.dim, fontSize: 10, letterSpacing: 3, marginBottom: 20, textTransform: 'uppercase' }}>
+                      English
+                    </div>
+                    <div style={{ fontSize: 34, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>
+                      {card.english}
+                    </div>
+                    <div style={{ color: C.dim, fontSize: 11, marginTop: 28 }}>タップして答えを見る</div>
+                  </div>
+                ) : (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ color: C.dim, fontSize: 10, letterSpacing: 3, marginBottom: 20, textTransform: 'uppercase' }}>
+                      日本語
+                    </div>
+                    <div style={{ fontSize: 28, fontWeight: 700, color: C.amber, lineHeight: 1.4 }}>
+                      {card.japanese}
+                    </div>
+                    <div style={{ color: C.muted, fontSize: 12, marginTop: 10 }}>{card.english}</div>
+                    {acc !== null && (
+                      <div style={{ color: C.dim, fontSize: 11, marginTop: 10 }}>
+                        正答率 {acc}%（{card.totalCount}回）
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {!flipped ? (
+                <button style={{ ...S.btnSub, maxWidth: 380, textAlign: 'center' }} onClick={doFlip}>
+                  答えを確認する
+                </button>
+              ) : !feedback ? (
+                <div style={{ ...S.row, maxWidth: 380 }}>
+                  <button style={S.btnNg} onClick={() => answer(false)}>✗ もう一度</button>
+                  <button style={S.btnOk} onClick={() => answer(true)}>✓ 覚えた</button>
+                </div>
+              ) : (
+                <div style={{ color: feedback === 'ok' ? C.green : C.red, fontSize: 13, fontWeight: 600 }}>
+                  {feedback === 'ok'
+                    ? `次回: ${nextStr(Date.now() + (card.interval||1)*86400000)}`
+                    : '明日また復習します'}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      // ── ADD ──
+      if (screen === 'add') return (
+        <div style={S.app}>
+          <header style={S.header}>
+            <button style={S.backBtn} onClick={() => setScreen('home')}>← ホーム</button>
+            <span style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>単語を追加</span>
+            <div style={{ width: 60 }} />
+          </header>
+          <div style={{ ...S.content, gap: 14 }}>
+            <div style={S.label}>英語</div>
+            <input
+              style={S.input}
+              placeholder="例: perseverance"
+              value={eng}
+              onChange={e => setEng(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && jp && addWord()}
+              autoFocus
+            />
+            <div style={S.label}>日本語の意味</div>
+            <input
+              style={S.input}
+              placeholder="例: 忍耐、粘り強さ"
+              value={jp}
+              onChange={e => setJp(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && eng && addWord()}
+            />
+            <button
+              style={{ ...S.btnPrimary, opacity: eng && jp ? 1 : 0.35, marginTop: 4 }}
+              onClick={addWord}
+              disabled={!eng || !jp}
+            >
+              {addDone ? '✓ 追加しました' : '追加する'}
+            </button>
+            <p style={{ color: C.dim, fontSize: 12, textAlign: 'center', margin: 0, lineHeight: 1.6 }}>
+              Claudeにスクショを送ると単語を読み取れます。<br/>そのままここに貼り付けて追加してください。
+            </p>
+          </div>
+        </div>
+      );
+
+      // ── BULK ADD ──
+      if (screen === 'bulk') return (
+        <div style={S.app}>
+          <header style={S.header}>
+            <button
+              style={S.backBtn}
+              onClick={() => {
+                if (candidates.length) { setCandidates([]); setBulkText(''); }
+                else setScreen('home');
+              }}
+            >
+              ← {candidates.length ? 'やり直す' : 'ホーム'}
+            </button>
+            <span style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>まとめて追加</span>
+            <div style={{ width: 60 }} />
+          </header>
+
+          {candidates.length === 0 ? (
+            <div style={{ ...S.content, gap: 12 }}>
+              <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.7 }}>
+                1行に「英語　日本語」を1組ずつ貼り付けて、次の画面で登録したい単語だけ選べます。<br/>
+                区切りはカンマ・コロン・タブいずれでもOK。
+              </div>
+              <textarea
+                style={S.textarea}
+                placeholder={'例:\nmention, 言及する\ncourageous, 勇気のある\nadjust, 慣れる、順応する'}
+                value={bulkText}
+                onChange={e => setBulkText(e.target.value)}
+                rows={10}
+              />
+              <button
+                style={{ ...S.btnPrimary, opacity: bulkText.trim() ? 1 : 0.35 }}
+                onClick={parseCandidates}
+                disabled={!bulkText.trim()}
+              >
+                候補を表示する
+              </button>
+            </div>
+          ) : (
+            <div style={{ ...S.content, gap: 0 }}>
+              <div style={{ color: C.muted, fontSize: 12, marginBottom: 10 }}>
+                間違えやすい単語だけチェックを入れてください（{candidates.filter(c => c.checked).length}/{candidates.length}件選択中）
+              </div>
+              <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6, paddingBottom: 12 }}>
+                {candidates.map((c, idx) => (
+                  <label
+                    key={idx}
+                    style={{
+                      ...S.wordRow,
+                      cursor: 'pointer',
+                      opacity: c.dup && !c.checked ? 0.5 : 1,
+                      borderColor: c.checked ? C.amber : C.border,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={c.checked}
+                      onChange={() => toggleCandidate(idx)}
+                      style={{ width: 18, height: 18, flexShrink: 0, accentColor: '#F5A623' }}
+                    />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontWeight: 600, color: C.text, fontSize: 14 }}>{c.english}</span>
+                        {c.dup && (
+                          <span style={{ fontSize: 9, color: C.dim, border: `1px solid ${C.dim}`, borderRadius: 4, padding: '1px 5px' }}>
+                            登録済み
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ color: C.muted, fontSize: 12, marginTop: 1 }}>{c.japanese}</div>
+                    </div>
+                  </label>
+                ))}
+              </div>
+              <button
+                style={{ ...S.btnPrimary, opacity: candidates.some(c => c.checked) ? 1 : 0.35, marginTop: 4 }}
+                onClick={confirmAddSelected}
+                disabled={!candidates.some(c => c.checked)}
+              >
+                選択した{candidates.filter(c => c.checked).length}語を追加する
+              </button>
+            </div>
+          )}
+
+          {bulkMsg && (
+            <div style={{ textAlign: 'center', color: C.green, fontSize: 13, fontWeight: 600, padding: '0 20px 16px' }}>
+              {bulkMsg}
+            </div>
+          )}
+        </div>
+      );
+
+      // ── BACKUP / RESTORE ──
+      if (screen === 'backup') return (
+        <div style={S.app}>
+          <header style={S.header}>
+            <button style={S.backBtn} onClick={() => { setScreen('home'); setExportText(''); setImportText(''); }}>
+              ← ホーム
+            </button>
+            <span style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>バックアップ / 復元</span>
+            <div style={{ width: 60 }} />
+          </header>
+
+          <div style={{ ...S.content, gap: 14, overflowY: 'auto', paddingBottom: 32 }}>
+
+            {/* 現在の状態 */}
+            <div style={{
+              background: C.surface, border: `1px solid ${backupStale || !lastBackup ? C.red : C.border}`,
+              borderRadius: 12, padding: '12px 14px', fontSize: 13,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                <span style={{ color: C.muted }}>登録単語</span>
+                <span style={{ fontWeight: 700 }}>{words.length}語</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: C.muted }}>最終バックアップ</span>
+                <span style={{ fontWeight: 600, color: lastBackup ? (backupStale ? C.red : C.green) : C.red }}>
+                  {lastBackup ? backupAgo : '未実施'}
+                </span>
+              </div>
+            </div>
+
+            {/* バックアップ */}
+            <div style={S.sectionTitle}>💾 バックアップを取る</div>
+            <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.7, marginTop: -6 }}>
+              ブラウザのデータを消すと単語も消えます。週1回はバックアップを取ってください。
+            </div>
+            <div style={S.row}>
+              <button style={{ ...S.btnPrimary, flex: 1 }} onClick={downloadBackup}>
+                ファイルに保存
+              </button>
+              <button style={{ ...S.btnSub, flex: 1 }} onClick={copyBackup}>
+                {copied ? '✓ コピー済み' : 'コピーする'}
+              </button>
+            </div>
+            <button
+              style={{ ...S.btnSub, textAlign: 'center', fontSize: 13 }}
+              onClick={makeExport}
+            >
+              テキストで表示する（手動コピー用）
+            </button>
+            {exportText && (
+              <textarea
+                style={{ ...S.textarea, fontSize: 11, height: 120 }}
+                value={exportText}
+                readOnly
+                onFocus={e => e.target.select()}
+              />
+            )}
+
+            {/* 復元 */}
+            <div style={{ ...S.sectionTitle, marginTop: 8 }}>♻️ バックアップから復元</div>
+            <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.7, marginTop: -6 }}>
+              保存したバックアップの中身を貼り付けてください。
+            </div>
+            <textarea
+              style={{ ...S.textarea, height: 100, fontSize: 12 }}
+              placeholder='{"v":1,"words":[...]} を貼り付け'
+              value={importText}
+              onChange={e => setImportText(e.target.value)}
+            />
+            <div style={S.row}>
+              <button
+                style={{ ...S.btnSub, flex: 1, opacity: importText.trim() ? 1 : 0.35 }}
+                onClick={() => restoreBackup('merge')}
+                disabled={!importText.trim()}
+              >
+                追加して復元
+              </button>
+              <button
+                style={{ ...S.btnNg, flex: 1, opacity: importText.trim() ? 1 : 0.35 }}
+                onClick={() => restoreBackup('replace')}
+                disabled={!importText.trim()}
+              >
+                全て置き換え
+              </button>
+            </div>
+            <div style={{ color: C.dim, fontSize: 11, lineHeight: 1.6 }}>
+              「追加して復元」= 今のデータを残したまま、足りない単語だけ追加（推奨）<br/>
+              「全て置き換え」= 今のデータを消して、バックアップの内容にする
+            </div>
+
+            {backupMsg && (
+              <div style={{ textAlign: 'center', color: C.amber, fontSize: 13, fontWeight: 600, lineHeight: 1.6 }}>
+                {backupMsg}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+
+      // ── LIST ──
+      if (screen === 'list') {
+        const sorted = [...words].sort((a, b) => {
+          const accA = a.totalCount ? a.correctCount / a.totalCount : 0;
+          const accB = b.totalCount ? b.correctCount / b.totalCount : 0;
+          return accA - accB;
+        });
+        return (
+          <div style={S.app}>
+            <header style={S.header}>
+              <button style={S.backBtn} onClick={() => setScreen('home')}>← ホーム</button>
+              <span style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>
+                単語一覧 <span style={{ color: C.muted, fontWeight: 400 }}>({words.length})</span>
+              </span>
+              <div style={{ width: 60 }} />
+            </header>
+            <div style={{ ...S.content, gap: 8, overflowY: 'auto', paddingBottom: 32 }}>
+              {words.length === 0 && (
+                <div style={{ color: C.dim, textAlign: 'center', marginTop: 60 }}>
+                  単語がまだありません
+                </div>
+              )}
+              {sorted.map(w => {
+                const acc = w.totalCount ? Math.round(w.correctCount / w.totalCount * 100) : null;
+                const isDue = (w.nextReview || 0) <= Date.now();
+                return (
+                  <div key={w.id} style={S.wordRow}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                        <span style={{ fontWeight: 600, color: C.text, fontSize: 15 }}>{w.english}</span>
+                        {isDue && (
+                          <span style={{
+                            background: C.amber, color: '#07090F',
+                            fontSize: 9, fontWeight: 700, borderRadius: 4, padding: '2px 5px',
+                          }}>復習</span>
+                        )}
+                      </div>
+                      <div style={{ color: C.muted, fontSize: 13, marginTop: 2 }}>{w.japanese}</div>
+                      <div style={{ color: C.dim, fontSize: 11, marginTop: 4 }}>
+                        {acc !== null
+                          ? <span style={{ color: acc >= 80 ? C.green : acc >= 50 ? C.amber : C.red }}>
+                              正答率 {acc}%
+                            </span>
+                          : <span>未学習</span>}
+                        {' · '}次回: {nextStr(w.nextReview)}
+                      </div>
+                    </div>
+                    <button style={S.delBtn} onClick={() => del(w.id)}>✕</button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      }
+
+      return null;
+    }
+
+    // ── Styles ───────────────────────────────────────────────
+    const S = {
+      app: {
+        fontFamily: "'Inter', 'Noto Sans JP', sans-serif",
+        background: C.bg, minHeight: '100vh', minHeight: '100dvh',
+        color: C.text, display: 'flex', flexDirection: 'column',
+      },
+      header: {
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '14px 20px', borderBottom: `1px solid ${C.border}`,
+      },
+      logo:     { fontSize: 22 },
+      logoText: { fontSize: 14, fontWeight: 700, letterSpacing: 3, color: C.amber, flex: 1, marginLeft: 10 },
+      backBtn:  { background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 13, padding: 0, width: 60, textAlign: 'left' },
+      content:  { flex: 1, display: 'flex', flexDirection: 'column', padding: '20px 20px', gap: 14 },
+      statsRow: { display: 'flex', gap: 10 },
+      emptyBox: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 16, padding: '32px 20px', textAlign: 'center' },
+      btnPrimary: {
+        background: C.amber, border: 'none', borderRadius: 14,
+        padding: '16px', fontSize: 16, fontWeight: 700,
+        color: '#07090F', cursor: 'pointer', width: '100%',
+      },
+      btnSub: {
+        background: C.surface, border: `1px solid ${C.border}`,
+        borderRadius: 12, padding: '13px', fontSize: 14,
+        color: C.text, cursor: 'pointer', flex: 1, width: '100%',
+      },
+      row:       { display: 'flex', gap: 10, width: '100%' },
+      btnOk: {
+        flex: 1, background: 'rgba(34,197,94,0.12)', border: `1px solid ${C.green}`,
+        borderRadius: 12, padding: '15px', color: C.green, fontSize: 15, fontWeight: 700, cursor: 'pointer',
+      },
+      btnNg: {
+        flex: 1, background: 'rgba(239,68,68,0.08)', border: `1px solid ${C.red}`,
+        borderRadius: 12, padding: '15px', color: C.red, fontSize: 15, fontWeight: 700, cursor: 'pointer',
+      },
+      input: {
+        background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12,
+        padding: '14px 16px', color: C.text, fontSize: 15, outline: 'none',
+        width: '100%',
+      },
+      label:     { color: C.muted, fontSize: 12, fontWeight: 500, letterSpacing: 1 },
+      sectionTitle: {
+        fontSize: 14, fontWeight: 700, color: C.amber,
+        letterSpacing: 1, marginTop: 4,
+      },
+      textarea: {
+        background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12,
+        padding: '14px 16px', color: C.text, fontSize: 14, outline: 'none',
+        width: '100%', fontFamily: "'Inter', 'Noto Sans JP', sans-serif",
+        resize: 'vertical', lineHeight: 1.6,
+      },
+      resultBox: {
+        background: C.surface, border: `1px solid ${C.border}`,
+        borderRadius: 16, display: 'flex', width: '100%', maxWidth: 340,
+      },
+      wordRow: {
+        background: C.surface, border: `1px solid ${C.border}`,
+        borderRadius: 12, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10,
+      },
+      delBtn: { background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: 14, padding: '4px 8px', flexShrink: 0 },
+    };
+
+    // ── Mount ────────────────────────────────────────────────
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js')
+          .catch(e => console.log('SW registration failed:', e));
+      });
+    }
+  </script>
+</body>
+</html>
