@@ -1,4 +1,4 @@
-const CACHE = 'vocab-drill-v2';
+const CACHE = 'vocab-drill-v3';
 
 self.addEventListener('install', e => {
   self.skipWaiting();

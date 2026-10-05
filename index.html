@@ -24,6 +24,7 @@
 <body>
   <div id="root"></div>
 
+  <script src="./wordlist.js"></script>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -103,6 +104,32 @@
       try { localStorage.setItem(KEY, JSON.stringify(w)); } catch {}
     }
 
+    // ── おすすめ単語（NGSL） ─────────────────────────────────
+    const KNOWN_KEY = 'vocab-fc-known';
+    function loadKnown() {
+      try {
+        const s = localStorage.getItem(KNOWN_KEY);
+        return s ? JSON.parse(s) : [];
+      } catch { return []; }
+    }
+    function saveKnown(k) {
+      try { localStorage.setItem(KNOWN_KEY, JSON.stringify(k)); } catch {}
+    }
+
+    const RAW_LIST = Array.isArray(window.WORDLIST) ? window.WORDLIST : [];
+    const LISTS = {
+      spoken: {
+        label: '会話でよく使う',
+        sub: 'NGSL-Spoken 721語',
+        items: RAW_LIST.filter(x => x[2] === 1),
+      },
+      general: {
+        label: '重要語',
+        sub: 'NGSL 2809語',
+        items: RAW_LIST.filter(x => x[3] > 0).sort((a, b) => a[3] - b[3]),
+      },
+    };
+
     // ── Sub-components ───────────────────────────────────────
     function StatCard({ label, value, highlight, green }) {
       return (
@@ -152,6 +179,11 @@
       const [importText, setImportText] = useState('');
       const [backupMsg, setBackupMsg]   = useState(null);
       const [copied,    setCopied]      = useState(false);
+      const [known,     setKnown]       = useState(() => loadKnown());
+      const [recList,   setRecList]     = useState('spoken');
+      const [recSize,   setRecSize]     = useState(10);
+      const [recBatch,  setRecBatch]    = useState([]); // {english, japanese, rank, learn}
+      const [recMsg,    setRecMsg]      = useState(null);
 
       const due      = buildQueue(words);
       const mastered = words.filter(w =>
@@ -248,9 +280,93 @@
         setTimeout(() => setBulkMsg(null), 3000);
       }
 
+      // ── おすすめ単語 ──
+      const handled = new Set([
+        ...words.map(w => w.english.toLowerCase()),
+        ...known.map(k => k.toLowerCase()),
+      ]);
+      function listProgress(key) {
+        const items = LISTS[key].items;
+        const done = items.filter(x => handled.has(x[0].toLowerCase())).length;
+        return { done, total: items.length };
+      }
+
+      function makeBatch(key = recList, size = recSize) {
+        const next = LISTS[key].items
+          .filter(x => !handled.has(x[0].toLowerCase()))
+          .slice(0, size)
+          .map(x => ({ english: x[0], japanese: x[1], rank: x[3], learn: true }));
+        setRecBatch(next);
+      }
+
+      function openRecommend() {
+        setRecMsg(null);
+        makeBatch();
+        setScreen('recommend');
+      }
+
+      function switchList(key) {
+        setRecList(key);
+        makeBatch(key, recSize);
+      }
+
+      function switchSize(n) {
+        setRecSize(n);
+        makeBatch(recList, n);
+      }
+
+      function toggleRec(idx) {
+        setRecBatch(b => b.map((c, i) => i === idx ? { ...c, learn: !c.learn } : c));
+      }
+
+      function editRec(idx, value) {
+        setRecBatch(b => b.map((c, i) => i === idx ? { ...c, japanese: value } : c));
+      }
+
+      function confirmBatch() {
+        if (!recBatch.length) return;
+        const toLearn = recBatch.filter(c => c.learn && c.japanese.trim());
+        const toKnow  = recBatch.filter(c => !c.learn);
+        const nw = [
+          ...words,
+          ...toLearn.map((c, idx) => ({
+            id: `${Date.now()}-n${idx}`,
+            english: c.english, japanese: c.japanese.trim(),
+            interval: 1, easeFactor: 2.5, repetitions: 0,
+            nextReview: 0, correctCount: 0, totalCount: 0,
+          })),
+        ];
+        const nk = [...known, ...toKnow.map(c => c.english)];
+        update(nw);
+        setKnown(nk); saveKnown(nk);
+
+        // 次のバッチを、今回の分を除いて作る
+        const done = new Set([
+          ...nw.map(w => w.english.toLowerCase()),
+          ...nk.map(k => k.toLowerCase()),
+        ]);
+        setRecBatch(LISTS[recList].items
+          .filter(x => !done.has(x[0].toLowerCase()))
+          .slice(0, recSize)
+          .map(x => ({ english: x[0], japanese: x[1], rank: x[3], learn: true })));
+        setRecMsg(`覚える ${toLearn.length}語を追加、知ってる ${toKnow.length}語を除外しました`);
+        setTimeout(() => setRecMsg(null), 3000);
+      }
+
+      function resetKnown() {
+        if (!known.length) return;
+        if (!window.confirm(`「知ってる」にした${known.length}語を、おすすめに戻します。よろしいですか？`)) return;
+        setKnown([]); saveKnown([]);
+        const done = new Set(words.map(w => w.english.toLowerCase()));
+        setRecBatch(LISTS[recList].items
+          .filter(x => !done.has(x[0].toLowerCase()))
+          .slice(0, recSize)
+          .map(x => ({ english: x[0], japanese: x[1], rank: x[3], learn: true })));
+      }
+
       // ── バックアップ / 復元 ──
       function makeExport() {
-        const json = JSON.stringify({ v: 1, exportedAt: Date.now(), words }, null, 0);
+        const json = JSON.stringify({ v: 1, exportedAt: Date.now(), words, known }, null, 0);
         setExportText(json);
         return json;
       }
@@ -320,6 +436,16 @@
             correctCount: w.correctCount ?? 0, totalCount: w.totalCount ?? 0,
           }));
 
+        const incomingKnown = Array.isArray(parsed.known) ? parsed.known.filter(k => typeof k === 'string') : [];
+        let nk;
+        if (mode === 'replace') {
+          nk = incomingKnown;
+        } else {
+          const haveK = new Set(known.map(k => k.toLowerCase()));
+          nk = [...known, ...incomingKnown.filter(k => !haveK.has(k.toLowerCase()))];
+        }
+        setKnown(nk); saveKnown(nk);
+
         let nw;
         if (mode === 'replace') {
           nw = clean;
@@ -366,6 +492,20 @@
               <button style={S.btnSub} onClick={() => setScreen('add')}>＋ 単語を追加</button>
               <button style={S.btnSub} onClick={() => setScreen('list')}>📋 単語一覧</button>
             </div>
+            {RAW_LIST.length > 0 && (() => {
+              const sp = listProgress('spoken');
+              return (
+                <button style={{ ...S.btnSub, textAlign: 'left', padding: '13px 16px' }} onClick={openRecommend}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>⭐ おすすめ単語</span>
+                    <span style={{ fontSize: 12, color: C.muted }}>会話 {sp.done}/{sp.total}</span>
+                  </div>
+                  <div style={{ height: 3, background: C.border, borderRadius: 2, marginTop: 8 }}>
+                    <div style={{ height: '100%', width: `${sp.total ? sp.done / sp.total * 100 : 0}%`, background: C.amber, borderRadius: 2 }} />
+                  </div>
+                </button>
+              );
+            })()}
             <button style={{ ...S.btnSub, textAlign: 'center' }} onClick={() => setScreen('bulk')}>
               📥 まとめて追加
             </button>
@@ -631,6 +771,151 @@
           )}
         </div>
       );
+
+      // ── RECOMMEND ──
+      if (screen === 'recommend') {
+        const prog = listProgress(recList);
+        const nLearn = recBatch.filter(c => c.learn).length;
+        const nKnow  = recBatch.length - nLearn;
+        return (
+          <div style={S.app}>
+            <header style={S.header}>
+              <button style={S.backBtn} onClick={() => setScreen('home')}>← ホーム</button>
+              <span style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>おすすめ単語</span>
+              <div style={{ width: 60 }} />
+            </header>
+
+            <div style={{ ...S.content, gap: 12, overflowY: 'auto', paddingBottom: 24 }}>
+              {/* リスト切り替え */}
+              <div style={S.row}>
+                {Object.entries(LISTS).map(([key, l]) => {
+                  const p = listProgress(key);
+                  const on = key === recList;
+                  return (
+                    <button
+                      key={key}
+                      onClick={() => switchList(key)}
+                      style={{
+                        flex: 1, textAlign: 'left', cursor: 'pointer',
+                        background: on ? 'rgba(245,166,35,0.10)' : C.surface,
+                        border: `1px solid ${on ? C.amber : C.border}`,
+                        borderRadius: 12, padding: '10px 12px', color: C.text,
+                      }}
+                    >
+                      <div style={{ fontSize: 14, fontWeight: 700, color: on ? C.amber : C.text }}>{l.label}</div>
+                      <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{l.sub}</div>
+                      <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>{p.done} / {p.total} 済み</div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div style={{ height: 4, background: C.border, borderRadius: 2 }}>
+                <div style={{ height: '100%', width: `${prog.total ? prog.done / prog.total * 100 : 0}%`, background: C.amber, borderRadius: 2, transition: 'width 0.4s ease' }} />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.6 }}>
+                  よく使う順に表示しています。<br/>知っている単語はチェックを外してください。
+                </div>
+                <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                  {[10, 20].map(n => (
+                    <button
+                      key={n}
+                      onClick={() => switchSize(n)}
+                      style={{
+                        background: n === recSize ? C.amber : C.surface,
+                        color: n === recSize ? '#07090F' : C.muted,
+                        border: `1px solid ${n === recSize ? C.amber : C.border}`,
+                        borderRadius: 8, padding: '5px 9px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                      }}
+                    >{n}語</button>
+                  ))}
+                </div>
+              </div>
+
+              {recBatch.length === 0 ? (
+                <div style={S.emptyBox}>
+                  <div style={{ fontSize: 36, marginBottom: 8 }}>🎉</div>
+                  <div style={{ color: C.muted, fontSize: 14 }}>
+                    このリストはすべて仕分け済みです
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {recBatch.map((c, idx) => (
+                    <div
+                      key={c.english}
+                      style={{ ...S.wordRow, borderColor: c.learn ? C.amber : C.border, opacity: c.learn ? 1 : 0.55 }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={c.learn}
+                        onChange={() => toggleRec(idx)}
+                        aria-label={`${c.english}を覚える`}
+                        style={{ width: 18, height: 18, flexShrink: 0, accentColor: '#F5A623' }}
+                      />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                          <span style={{ fontWeight: 600, color: C.text, fontSize: 15 }}>{c.english}</span>
+                          {c.rank > 0 && <span style={{ fontSize: 10, color: C.dim }}>#{c.rank}</span>}
+                          {!c.learn && <span style={{ fontSize: 10, color: C.muted }}>知ってる</span>}
+                        </div>
+                        <input
+                          value={c.japanese}
+                          onChange={e => editRec(idx, e.target.value)}
+                          disabled={!c.learn}
+                          style={{
+                            width: '100%', marginTop: 4, background: 'transparent',
+                            border: 'none', borderBottom: `1px dashed ${c.learn ? C.dim : 'transparent'}`,
+                            color: C.muted, fontSize: 13, padding: '2px 0', outline: 'none',
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {recBatch.length > 0 && (
+                <button
+                  style={{ background: 'none', border: 'none', color: C.muted, fontSize: 12, cursor: 'pointer', padding: 4, alignSelf: 'flex-end' }}
+                  onClick={() => {
+                    const allOn = recBatch.every(c => c.learn);
+                    setRecBatch(b => b.map(c => ({ ...c, learn: !allOn })));
+                  }}
+                >
+                  {recBatch.every(c => c.learn) ? 'すべて「知ってる」にする' : 'すべて「覚える」にする'}
+                </button>
+              )}
+
+              {recBatch.length > 0 && (
+                <button style={S.btnPrimary} onClick={confirmBatch}>
+                  覚える{nLearn}語を追加{nKnow > 0 ? `・知ってる${nKnow}語を除外` : ''}
+                </button>
+              )}
+
+              {recMsg && (
+                <div style={{ textAlign: 'center', color: C.green, fontSize: 13, fontWeight: 600 }}>{recMsg}</div>
+              )}
+
+              {known.length > 0 && (
+                <button
+                  style={{ background: 'none', border: 'none', color: C.dim, fontSize: 12, cursor: 'pointer', padding: 4 }}
+                  onClick={resetKnown}
+                >
+                  「知ってる」にした{known.length}語をおすすめに戻す
+                </button>
+              )}
+
+              <div style={{ color: C.dim, fontSize: 10, lineHeight: 1.6, marginTop: 4 }}>
+                単語リスト: New General Service List 1.2 / NGSL-Spoken 1.2（Browne, Culligan & Phillips, CC BY-SA 4.0）。
+                日本語訳の一部は ejdict-hand（パブリックドメイン）を短縮して使用。訳はタップして修正できます。
+              </div>
+            </div>
+          </div>
+        );
+      }
 
       // ── BACKUP / RESTORE ──
       if (screen === 'backup') return (
